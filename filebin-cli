@@ -1,0 +1,159 @@
+#!/usr/bin/env bash
+  #=================================================
+  # Project: filebin-cli
+  # Author: ConzZah / 2024
+  # Last Modification: 26.12.2024 / 23:12  [v0.1]
+  #=================================================
+
+wd="$(pwd)";t="~~~~~~~~~~~~~~~~"
+! type -p curl >/dev/null && echo "CURL MISSING" && exit 1 ||: # <-- check if curl is available
+init () {
+# init variables
+fb="https://filebin.net"; bin_id=""; exitcode=""
+local_file=""; local_filename=""; remote_filename=""
+bin_sha256sums=""; bin_total_size=""; bin_filecount=""
+bin_filenames=""; bin_creationdate=""; bin_expirydate=""
+}
+
+get_bin_info () {
+### arguably the most important function.
+### its job is organizing and reformatting json output so we can parse it easier with tools like grep, sed, cut, etc..
+cleanup; curl -fsSL -X "GET" "$fb/$bin_id" -H "accept: application/json" -o "$bin_id.info.raw" 
+# organize relevant data into variables ( 💀️ i refuse to use jq 💀️ )
+bin_id="$(grep -s "id" "$bin_id.info.raw"| cut -d '"' -f 4)"
+bin_expirydate="$(grep -s -m1 "expired_at_relative" "$bin_id.info.raw"| cut -d '"' -f 4)"
+bin_creationdate="$(grep -s -m1 "created_at_relative" "$bin_id.info.raw"| cut -d '"' -f 4)"
+bin_readonly="$(grep -s "readonly" "$bin_id.info.raw"| tr -s " "| cut -b 14-| sed 's#,##g')" # <-- bin_readonly will always return either true or false
+bin_filecount="$(grep -s -m1 "files" "$bin_id.info.raw"| tr -s " "| cut -b 11-| sed 's#,##g')" # <-- bin_filecount will always return an integer
+bin_total_size="$(grep -s -m1 "bytes_readable" "$bin_id.info.raw"| cut -d '"' -f 4)" # <-- for bin_total_size we grep for the first occurence of 'bytes_readable' and extract field 4 with cut to get the size.
+bin_filesizes="$(grep -s "bytes_readable" "$bin_id.info.raw"| sed '1d'| cut -d '"' -f 4)" # <-- for bin_filesizes, we use sed to omit the first line because (as we know) it contains the total size of the bin.
+bin_filenames="$(grep -s "filename" "$bin_id.info.raw"| cut -d '"' -f 4)"
+bin_sha256sums="$(grep -s sha256 "$bin_id.info.raw"| cut -d '"' -f 4)"; check4error
+
+# 🛸️ reformat data 🛸️
+# ( so ":" becomes our universal delimiter. ) 
+
+# index.info = :sha265s:filenames:filesizes:
+# fields:          1       2        3
+i="1"; while [ $i -le $bin_filecount ]; do # <-- while $i is less than or equal to $bin_filecount, get lines one by one.
+sha256sum_current=""; sha256sum_current="$(echo "$bin_sha256sums"| sed -n "$i p")"
+bin_filename_current=""; bin_filename_current="$(echo "$bin_filenames"| sed -n "$i p")"
+bin_filesize_current=""; bin_filesize_current="$(echo "$bin_filesizes"| sed -n "$i p")"
+# ^ ^ ^ we use sed to print the line specified by $i into our "$_current" vars
+echo ":$sha256sum_current:$bin_filename_current:$bin_filesize_current:" >> "$bin_id-index.info" # <-- reformat
+((i++)); done
+
+# bin.info = bin_id:total_size:filecount:readonly:expirydate:creationdate:
+# fields:      2        3        4         5         6          7
+ echo ":$bin_id:$bin_total_size:$bin_filecount:$bin_readonly:$bin_expirydate:$bin_creationdate:" > "$bin_id-bin.info"
+}
+
+
+upload_to_bin () { 
+x="upload"
+get_bin_info
+# before we go any further, verify that the file we are trying to upload exists.
+[ -z "$local_file" ] && echo "ERROR: SPECIFY THE PATH TO A FILE AND TRY AGAIN." && quit # <-- if user enters nothing, echo error and exit
+[ ! -f "$local_file" ] && echo "ERROR: '$local_file' DOESN'T EXIST OR IS A DIRECTORY." && quit ||: # <-- if the file doesn't exist we echo error and exit. 
+
+# upload sequence
+local_filename="$(basename "$local_file")" # <-- get basename of the file we want to upload
+echo -e "\nUPLOADING '$local_filename' TO '$fb/$bin_id"
+curl -fsSL -X "POST" "$fb/$bin_id/$local_filename" -H "accept: application/json" -H "Content-Type: application/octet-stream" --data-binary @"$local_file"
+verify_sha256sum
+}
+
+download_from_bin () { 
+x="download"
+get_bin_info
+# if the user specified zip / tar instead of a single filename, prepare to download the whole bin in chosen format:
+if [[ "$remote_filename" =~ ^(zip|tar)$ ]]; then fb="$fb/archive"; echo ":tar:zip:" >> "$bin_id-index.info"; fi 
+# if "$remote_filename is empty, run ls_bin, and let the user choose which file to download:
+[ -z "$remote_filename" ] && ls_bin && echo -e "ENTER THE NAME OF THE FILE YOU WANT TO DOWNLOAD" && read remote_filename
+
+# (failsafe for individual files) we check if $remote_filename is found in $bin_filenames
+if [[ "$remote_filename" != "$(echo "$(<$bin_id-index.info)"| grep -o "$remote_filename")" ]]; then
+echo -e "ERROR! FILE: '$remote_filename' DOES NOT EXIST at  '$fb/$bin_id'"; quit; fi 
+# actual download of the file.
+echo "DOWNLOADING: $remote_filename"; curl -fsSL -O "$fb/$bin_id/$remote_filename"
+# if user downloaded the bin in archive format, we can't compare checksums, so we exit early here.
+if [[ "$fb" == *"/archive" ]]; then mv "$remote_filename" "$bin_id.$remote_filename"; quit; fi
+verify_sha256sum
+}
+
+verify_sha256sum () { 
+# tries to verify that uploads or downloads aren't fragmented by comparing two sha256sums
+# we define _x twice because sha256sum must have the full filepath to create a checksum. ( _x = filename, _X = filepath )
+[[ "$x" == "upload" ]] && _x="$local_filename" && _X="$local_file" # <-- if we upload, x = local
+[[ "$x" == "download" ]] && _x="$remote_filename" && _X="$_x" # <-- if we download, x = remote
+sleep 0.7; get_bin_info; echo -e "\nCOMPARING HASHES.."
+sha256sum "$_X"|cut -d " " -f 1 > .local_checksum # <-- create local checksum
+remote_sha256=""; remote_sha256="$(grep -s "$_x" "$bin_id-index.info"|cut -d ":" -f 2)"; echo "$remote_sha256" > .remote_checksum # <-- fetch remote checksum 
+### 🤖️ ARE YOU READY FOR DIFF https://www.youtube.com/watch?v=DJ6CcEOmlYU&t12s 🤖️ ###
+diff -q .local_checksum .remote_checksum >/dev/null && echo -e "\n ✔️ SHA256sums MATCH! ${x^^} SUCCESSFUL ✔️ " && quit || echo -e "\n ✖️ ERROR: SHA256sums DON'T MATCH. ${x^^}ED DATA FRAGMENTED ✖️ " && quit
+}
+
+ls_bin () { get_bin_info; echo -e "\nFILES: $bin_filecount  TOTAL SIZE: $bin_total_size  READ-ONLY: $bin_readonly\n$t$t$t\n$bin_filenames\n$t$t$t\n$fb/$bin_id\nbin will expire $bin_expirydate\n" ;}
+
+lock_bin () { 
+echo -e "\nWARNING! DO YOU REALLY WANT TO LOCK THE BIN: $bin_id ?\n\nTHIS CAN'T BE UNDONE! \n"
+read -r -p "[Y/N] " yn; case $yn in 
+y|Y) curl -fsSL -X "PUT" "$fb/$bin_id" -H "accept: application/json"; echo "$bin_id IS NOW READ-ONLY."; quit ;; 
+n|N) echo "LOCK CANCELED"; quit ;;
+*) echo "LOCK CANCELED"; quit
+esac
+}
+
+delete_bin () { 
+echo -e "\nWARNING! DO YOU REALLY WANT TO DELETE THE BIN: $bin_id ?\n\nTHIS CAN'T BE UNDONE! \n"
+read -r -p "[Y/N] " yn; case $yn in 
+y|Y) curl -fsSL -X "DELETE" "$fb/$bin_id" -H "accept: application/json"; quit ;; 
+n|N) echo "DELETE CANCELED"; quit ;;
+*) echo "DELETE CANCELED"; quit
+esac
+}
+
+check4error () {
+# basic errorchecking using exit codes and conditions
+exitcode="$?" # <-- write exit code of last command to variable
+[ "$exitcode" != "0" ] && echo "EXIT CODE: $exitcode" && quit; exitcode="" # <-- if errorcode is anything else than 0, print the captured exit code and exit
+[ -z "$bin_expirydate" ] && echo "ERROR: BIN DOESN'T EXIST" && quit # <-- if no $bin_expirydate was found (because there should ALWAYS be one unless the url is invalid) exit
+}
+
+
+show_help () { 
+echo -e "\n      /// filebin-cli v0.1 // Author: ConzZah ©️ 2024 // LICENSE: MIT /// 
+\nOPTIONS:\n
+ls, list             list files in bin\n
+u, ul, upload        upload files to bin\n
+d, dl, download      download files from bin\n
+l, lock              lock bin\n
+del, delete          delete bin\n
+USAGE: ./filebin-cli <FILEBIN ID/URL> OPTION <PATH/TO/LOCAL/FILE>\n"
+}
+
+cleanup () { rm -f *.info.raw *-index.info *-bin.info .local_checksum .remote_checksum ;}
+
+quit () { cleanup; exit ;} # <-- clean up old files & exit  
+
+###### launch ###### launch ###### launch ###### launch ###### launch ###### launch ###### launch ###### launch ######
+
+# ( $1 refers to filebin id / url, $2 to option, and $3 refers to filepath / name )
+
+init
+
+## filebin url handling
+# if $2 has any value and contains the filebin url, get rid of it with sed, so only the bin_id remains, & use set to reassign positional parameters
+[ -n "$1" ] && [[ "$1" == "$fb"* ]] && formatted_bin_id="$(echo "$1"| sed "s#"$fb"/##g")" && set -- "$formatted_bin_id" "$2" "$3" "$4" "$5" "$6" "$7" "$8" "$9"
+[ -n "$1" ] && bin_id="$1" ||: # <-- in any case, "$1" will be assigned to $bin_id
+
+### OPTIONS
+if [[ "$2" =~ ^(ls|LS|list)$ ]]; then [ -z "$2" ] && echo "ERROR: ID CAN'T BE EMPTY" && quit; ls_bin; quit; fi
+if [[ "$2" =~ ^(d|D|dl|DL|download)$ ]]; then remote_filename="$3"; download_from_bin; quit; fi # <-- if user doesn't specify anything in "$3", assume they want the full bin as zip.
+if [[ "$2" =~ ^(u|U|ul|UL|upload)$ ]]; then local_file="$3"; upload_to_bin; quit; fi # <-- $local_file holds full path.
+if [[ "$2" =~ ^(l|L|lock|LOCK)$ ]]; then lock_bin; quit; fi
+if [[ "$2" =~ ^(del|DEL|delete|DELETE)$ ]]; then delete_bin; quit; fi
+### END OF OPTIONS
+[ ! -z "$1" ] && show_help && quit || [ -z "$1" ] && show_help && quit 
+
+###### launch ###### launch ###### launch ###### launch ###### launch ###### launch ###### launch ###### launch ######
