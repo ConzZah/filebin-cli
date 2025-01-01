@@ -2,7 +2,7 @@
   #=================================================
   # Project: filebin-cli
   # Author: ConzZah / 2024
-  # Last Modification: 31.12.2024 / 05:42 [v0.2.1]
+  # Last Modification: 01.01.2025 / 06:04 [v0.2.2]
   #=================================================
 
 wd="$(pwd)"
@@ -81,12 +81,6 @@ echo ":$sha256sum_current:$bin_filename_current:$bin_filesize_readable_current:$
 # $bdex  =    :bin_id:total_size:filecount:readonly:expirydate_rel:creationdate_rel:updatedate_rel:
 # fields:         2        3        4           5           6              7             8
  echo ":$bin_id:$bin_total_size_readable:$bin_filecount:$bin_readonly:$bin_expirydate_rel:$bin_creationdate_rel:$bin_updatedate_rel:" > "$bdex"
-
-### IMPORTANT ###
-# if "$remote_filename" is set to anything, try to grep the definitive result:
-# (this allows you to only type out part of a filename and have it still be matched, if it should exist.)
-# (we basically achieved semi-autocompletion for $remote_filename with this one 🗿️)
-[ ! -z "$remote_filename" ] && remote_filename="$(grep -m1 "$remote_filename" "$fdex"| cut -d ":" -f 3)"
 }
 
 upload_to_bin () {
@@ -95,11 +89,11 @@ x="upload"
 # before we go any further, verify that the file we are trying to upload exists.
 [ -z "$local_file" ] && echo "ERROR: SPECIFY THE PATH TO A FILE AND TRY AGAIN." && quit # <-- if user enters nothing, echo error and exit
 [ ! -f "$local_file" ] && echo "ERROR: '$local_file' DOESN'T EXIST OR IS A DIRECTORY." && quit ||: # <-- if the file doesn't exist we echo error and exit. 
-
 # upload sequence
 local_filename="$(basename "$local_file")" # <-- get basename of the file we want to upload
+urlencode_filename
 echo -e "\nUPLOADING '$local_filename' TO '$fb/$bin_id"
-curl -fsSL -X "POST" "$fb/$bin_id/$local_filename" -H "accept: application/json" -H "Content-Type: application/octet-stream" --data-binary @"$local_file"
+curl -fsSL -X "POST" "$fb/$bin_id/$urlencoded_filename" -H "accept: application/json" -H "Content-Type: application/octet-stream" --data-binary @"$local_file"; check4error
 verify_sha256sum
 }
 
@@ -110,9 +104,10 @@ dlmsg="DOWNLOADING $remote_filename"
 # if "$remote_filename is empty, assume the user wants to download the whole bin in zip format:
 [ -z "$remote_filename" ] && remote_filename="zip"
 # if the user specified nothing (or zip / tar) after dl, prepare to download the whole bin in chosen format:
-if [[ "$remote_filename" =~ ^(zip|tar)$ ]]; then fb="$fb/archive"; dlmsg="DOWNLOADING ENTIRE BIN.."; echo ":$bin_id.tar:$bin_id.zip:" >> "$fdex"; fi 
+if [[ "$remote_filename" =~ ^(zip|tar)$ ]]; then fb="$fb/archive"; dlmsg="DOWNLOADING ENTIRE BIN.."; fdex=".tmp$fdex"; echo -e "tar\nzip" >> "$fdex"; fi 
 verify_remote_filename_existence
-echo "$dlmsg"; curl -fsSL -O "$fb/$bin_id/$remote_filename" # <-- actual download of the file.
+urlencode_filename
+echo "$dlmsg"; curl -fsSL -o "$remote_filename" "$fb/$bin_id/$urlencoded_filename"; check4error # <-- actual download of the file.
 # if user downloaded the bin in archive format, we can't compare checksums, so we exit early here.
 if [[ "$fb" == *"/archive" ]]; then mv "$remote_filename" "$bin_id.$remote_filename"; quit; fi
 verify_sha256sum
@@ -120,10 +115,21 @@ verify_sha256sum
 
 verify_remote_filename_existence () {
 errormsg="ERROR: THE REQUESTED FILE DOESN'T EXIST @ "$fb/$bin_id" \n${x^^} CANCELED."
+# if "$remote_filename" is set to anything, try to grep the definitive result:
+# (this allows you to only type out part of a filename and have it still be matched, if it should exist.)
+# (we basically achieved semi-autocompletion for $remote_filename with this one 🗿️)
+[ ! -z "$remote_filename" ] && remote_filename="$(grep -m1 "$remote_filename" "$fdex"| cut -d ":" -f 3)"
 # if "$remote_filename" is empty, echo errormsg and quit
 [ -z "$remote_filename" ] && echo -e "$errormsg" && quit
-# (failsafe for individual files) we check if $remote_filename is found in $fdex.
-if [[ "$remote_filename" != "$(grep -o "$remote_filename" "$fdex")" ]]; then echo -e "$errormsg"; quit; fi
+# else we check if $remote_filename actually exists in $fdex.
+if [[ "$remote_filename" != "$(grep -o -m1 "$remote_filename" "$fdex")" ]]; then echo -e "$errormsg"; quit; fi
+}
+
+urlencode_filename () {
+# mainly there so curl doesn't break on filenames that contain " ", "(", ")" etc..
+[ "$x" == "upload" ] && urlencoded_filename="$local_filename"
+[[ "$x" =~ ^("download"|"delete")$ ]] && urlencoded_filename="$remote_filename"
+urlencoded_filename="$(echo "$urlencoded_filename"| sed -e 's# #%20#g' -e 's#(#%28#g' -e 's#)#%29#g')" 
 }
 
 verify_sha256sum () { 
@@ -149,8 +155,8 @@ echo -e "$t$t$t$t \n<FNAME> - <FSIZE> - <FTYPE>\n$t$t" && cut -d ":" -f 3,4,8 "$
 
 # (single file)
 # if the user specified a filename after ls, check if the requested file exists and show its metadata:
-[ ! -z "$remote_filename" ] && verify_remote_filename_existence && echo -e "$t$t$t$t$t\nNAME: $remote_filename \nSIZE: "$(grep "$remote_filename" "$fdex"| cut -d ":" -f 4)" \
-\nSIZE (in bytes): "$(grep "$remote_filename" "$fdex"| cut -d ":" -f 5)"\nCREATED: "$(grep "$remote_filename" "$fdex"| cut -d ":" -f 6)" \nUPDATED: "$(grep "$remote_filename" "$fdex"| cut -d ":" -f 7)" \nSHA256: "$(grep "$remote_filename" "$fdex"| cut -d ":" -f 2)" \nURL: $fb/$bin_id/$remote_filename \n$t$t$t$t$t"
+[ ! -z "$remote_filename" ] && verify_remote_filename_existence && echo -e "$t$t$t$t$t\nNAME: $remote_filename \nSIZE: "$(grep -m1 "$remote_filename" "$fdex"| cut -d ":" -f 4)" \
+\nSIZE (in bytes): "$(grep -m1 "$remote_filename" "$fdex"| cut -d ":" -f 5)"\nCREATED: "$(grep -m1 "$remote_filename" "$fdex"| cut -d ":" -f 6)" \nUPDATED: "$(grep -m1 "$remote_filename" "$fdex"| cut -d ":" -f 7)" \nSHA256: "$(grep -m1 "$remote_filename" "$fdex"| cut -d ":" -f 2)" \nURL: $fb/$bin_id/$remote_filename \n$t$t$t$t$t"
 }
 
 lock_bin () {
@@ -174,11 +180,11 @@ esac
 }
 
 delete_file () {
-get_bin_info; verify_remote_filename_existence
+get_bin_info; verify_remote_filename_existence; urlencode_filename
 # asks if you want to delete a single file from the bin (also defaults to no)
 echo -e "\nWARNING! \n\nDO YOU REALLY WANT TO DELETE THE FILE: \"$remote_filename\" ?\n\nTHIS CAN'T BE UNDONE! \n"
 read -r -p "[Y/N] " yn; case $yn in
-y|Y) curl -fsSL -X "DELETE" "$fb/$bin_id/$remote_filename" -H "accept: application/json"; quit ;; 
+y|Y) curl -fsSL -X "DELETE" "$fb/$bin_id/$urlencoded_filename" -H "accept: application/json"; quit ;; 
 n|N) echo "DELETE CANCELED"; quit ;; *) echo "DELETE CANCELED"; quit
 esac
 }
@@ -197,7 +203,7 @@ exitcode="$?" # <-- write exit code of last command to variable
 }
 
 show_help () { 
-echo -e "\n     /// filebin-cli v0.2.1 // Author: ConzZah ©️ 2024 // LICENSE: MIT /// 
+echo -e "\n     /// filebin-cli v0.2.2 // Author: ConzZah ©️ 2024 // LICENSE: MIT /// 
 \nOPTIONS:\n
 ls, list             list files in bin\n
 u, ul, upload        upload files to bin\n
